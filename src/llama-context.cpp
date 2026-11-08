@@ -2674,6 +2674,10 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         // K2-Horizon's per-layer group-norm attention and optional MoVA routing graph
         // creates substantially more metadata nodes than the generic 8*n_tensors budget.
         res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+    } else if (model.arch == LLM_ARCH_K2_HORIZON) {
+        // K2-Horizon's per-layer group-norm attention and optional MoVA routing graph
+        // creates substantially more metadata nodes than the generic 8*n_tensors budget.
+        res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_BAILINGMOE3 ||

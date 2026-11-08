@@ -182,9 +182,6 @@ llama_kv_cache::llama_kv_cache(
         size_t bytes_per_cell = 0;
         for (uint32_t il = 0; il < n_layer; il++) {
             if (hparams.has_kv(il) && (!filter || filter(il))) {
-                if (hparams.n_embd_head_k(il) != 256 || hparams.n_embd_head_v(il) != 256) {
-                    throw std::runtime_error("KV streaming requires a head size of 256");
-                }
                 bytes_per_cell += ggml_row_size(type_k, hparams.n_embd_k_gqa(il)) + ggml_row_size(type_v, hparams.n_embd_v_gqa(il));
             }
         }
@@ -347,7 +344,10 @@ llama_kv_cache::llama_kv_cache(
     if (n_slots > 0) {
         std::vector<llama_kv_stream::layer> sl;
         for (const auto & layer : layers) {
-            sl.push_back({ layer.k, layer.v });
+            sl.push_back({ layer.k, layer.v,
+                    (int64_t) hparams.n_head_kv(layer.il),
+                    (int64_t) hparams.n_embd_head_k(layer.il),
+                    (int64_t) hparams.n_embd_head_v(layer.il) });
         }
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(layers[0].k->buffer));
         stream = std::make_unique<llama_kv_stream>(sl, n_slots, n_slots_decode, kv_size, dev, hparams.no_alloc);
@@ -1809,9 +1809,9 @@ llama_kv_stream_attn llama_kv_cache::get_kv_stream_attn(ggml_context * ctx, ggml
         res.consumed = stream->consumed(ikv);
     }
 
-    // the paged decode kernel takes up to decode_max_tokens query tokens (decode and speculative verification), and
-    // prefill if it can
-    if (n_tokens <= llama_kv_stream::decode_max_tokens || stream->paged_prefill()) {
+    // Use page-table attention only when the backend supports both decode and prefill for this model's real shape.
+    // Otherwise gather streamed pages into the contiguous slot and use ordinary Flash Attention.
+    if (stream->paged_attention()) {
         res.k = get_k(ctx, il, n_kv, sinfo);
         res.v = get_v(ctx, il, n_kv, sinfo);
         res.table = ikv;

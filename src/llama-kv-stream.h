@@ -73,6 +73,9 @@ public:
     struct layer {
         ggml_tensor * k;
         ggml_tensor * v;
+        int64_t n_head_kv;
+        int64_t head_dim_k;
+        int64_t head_dim_v;
     };
 
     // a run of logical pages held by consecutive pool slots
@@ -94,12 +97,12 @@ public:
     ggml_backend_dev_t device() const { return dev; }
 
     // the backend whose stream runs the graphs: page moves are queued on it
-    // n_head: query heads, to check whether the backend's attention takes paged K/V for prefill ubatches too
+    // Probe paged decode and prefill with the model's actual head dimensions and GQA ratio.
     void set_backend(ggml_backend_t backend, int64_t n_head);
 
-
-    // prefill ubatches read the pages through the page table like decode, instead of attending a gather
+    // Paged mode is enabled only when both paths support this model's actual shape.
     bool paged_prefill() const { return prefill_paged; }
+    bool paged_attention() const { return prefill_paged && decode_paged; }
 
     // the attended pages of the current ubatch as runs of consecutive pool or ring pages
     const ggml_fa_page_runs * page_runs() const { return &runs_desc; }
@@ -143,7 +146,7 @@ public:
     uint32_t n_ring() const { return slots[0].k ? (uint32_t) (slots[0].k->ne[1]/page_size) : 0; }
 
     // the slots hold the streamed pages packed (paged prefill and decode), so they can be smaller than the context
-    bool ring_packed() const { return prefill_paged && !debug_rotate; }
+    bool ring_packed() const { return paged_attention() && !debug_rotate; }
 
     // bytes of one page in both slots
     size_t ring_page_size() const { return 2*page_size*(row_size(0, false) + row_size(0, true)); }
@@ -256,6 +259,7 @@ private:
     std::atomic<uint64_t>   epoch{0};        // bumped by drain: the host store or the slots may change, prefetches are stale
 
     bool     prefill_paged = false;
+    bool     decode_paged  = false;
 
     bool     debug_rotate = false;
 

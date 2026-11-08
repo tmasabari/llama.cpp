@@ -21,9 +21,11 @@ llama_kv_stream::llama_kv_stream(const std::vector<layer> & layers, uint32_t n_s
     GGML_ASSERT(!layers.empty());
 
     for (const auto & l : layers) {
-        // the device slots share one row layout
-        if (l.k->ne[0] != layers[0].k->ne[0] || l.v->ne[0] != layers[0].v->ne[0]) {
-            throw std::runtime_error("KV streaming requires the same K/V width in every layer");
+        // the device slots and paged-attention probe share one layout across layers
+        if (l.k->ne[0] != layers[0].k->ne[0] || l.v->ne[0] != layers[0].v->ne[0] ||
+                l.n_head_kv != layers[0].n_head_kv ||
+                l.head_dim_k != layers[0].head_dim_k || l.head_dim_v != layers[0].head_dim_v) {
+            throw std::runtime_error("KV streaming requires the same K/V dimensions in every layer");
         }
     }
 
@@ -156,9 +158,10 @@ void llama_kv_stream::alloc_slots(int64_t rows, bool no_alloc) {
 void llama_kv_stream::set_backend(ggml_backend_t backend, int64_t n_head) {
     this->backend = backend;
 
-    // does the backend's attention take paged K/V for a prefill ubatch too? then prefill needs no gathers
+    // Probe with the model's actual K/V head dimensions and GQA ratio. Paged kernels may be specialized
+    // (for example, the current RDNA4 implementation requires D=256 and GQA=6).
     ggml_init_params params = {
-        /*.mem_size   =*/ 8*ggml_tensor_overhead(),
+        /*.mem_size   =*/ 24*ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -166,31 +169,40 @@ void llama_kv_stream::set_backend(ggml_backend_t backend, int64_t n_head) {
 
     const ggml_tensor * pk = layers[0].k;
     const ggml_tensor * pv = layers[0].v;
-    const int64_t d    = 256;
-    const int64_t n_kv = pk->ne[0]/d;
-    const int64_t nb   = 512;
+    const int64_t d_k = layers[0].head_dim_k;
+    const int64_t d_v = layers[0].head_dim_v;
+    const int64_t n_kv = layers[0].n_head_kv;
 
-    auto heads = [&](const ggml_tensor * pool) {
+    auto heads = [&](const ggml_tensor * pool, int64_t d) {
         ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), pool->type, pool->ne[0], pool->ne[1]);
-        return ggml_view_4d(ctx.get(), t, d, t->ne[1], n_kv, 1, t->nb[1], ggml_row_size(t->type, d), ggml_nbytes(t), 0);
+        return ggml_view_4d(ctx.get(), t, d, t->ne[1], n_kv, 1, t->nb[1],
+                ggml_row_size(t->type, d), ggml_nbytes(t), 0);
     };
-    ggml_tensor * q     = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d, nb, n_head, 1);
-    ggml_tensor * mask  = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, page_size, nb, 1, 1);
-    ggml_tensor * pages = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 1);
-    ggml_tensor * fa    = ggml_flash_attn_ext(ctx.get(), q, heads(pk), heads(pv), mask, 1.0f, 0.0f, 0.0f);
-    ggml_flash_attn_ext_set_pages(fa, pages, 0, page_size, nullptr, nullptr);
+
     ggml_fa_page_run  probe_run  = { 0, 0, 1, 1 };
     ggml_fa_page_runs probe_runs = { 1, &probe_run };
-    ggml_flash_attn_ext_set_page_runs(fa, &probe_runs);
-    ggml_prec_set_acc(fa, GGML_PREC_F32);
+    auto probe = [&](int64_t n_tokens, bool with_page_runs) {
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d_k, n_tokens, n_head, 1);
+        ggml_tensor * mask  = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, page_size, n_tokens, 1, 1);
+        ggml_tensor * pages = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 1);
+        ggml_tensor * fa    = ggml_flash_attn_ext(ctx.get(), q, heads(pk, d_k), heads(pv, d_v),
+                mask, 1.0f, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_pages(fa, pages, 0, page_size, nullptr, nullptr);
+        if (with_page_runs) {
+            ggml_flash_attn_ext_set_page_runs(fa, &probe_runs);
+        }
+        ggml_prec_set_acc(fa, GGML_PREC_F32);
+        return fa;
+    };
 
-    prefill_paged = ggml_backend_supports_op(backend, fa);
-    LLAMA_LOG_INFO("%s: prefill attends %s\n", __func__, prefill_paged ? "the pages directly" : "gathers of the pages");
+    decode_paged  = ggml_backend_supports_op(backend, probe(1, false));
+    prefill_paged = ggml_backend_supports_op(backend, probe(512, true));
+    LLAMA_LOG_INFO("%s: paged attention: decode %s, prefill %s\n", __func__,
+            decode_paged ? "supported" : "gather fallback",
+            prefill_paged ? "supported" : "gather fallback");
 
-    // Without gathers, a slot only holds the pages that stream, packed: the attended pages that are not resident. The
-    // pool is full of attended pages whenever any page streams (free slots take attended pages first, and pages outside
-    // the attended range leave fewer to attend), so at most n_pages - n_slots stream per ubatch.
-    if (prefill_paged && ggml_backend_buffer_get_size(slots_buf.get()) > 0 && !debug_rotate) {
+    // The packed ring is safe only when both paged-attention paths support this model's actual shape.
+    if (paged_attention() && ggml_backend_buffer_get_size(slots_buf.get()) > 0 && !debug_rotate) {
         const uint32_t n_ring = std::max<uint32_t>(1, n_pages > n_slots ? n_pages - n_slots : 1);
         alloc_slots((int64_t) n_ring*page_size, false);
         LLAMA_LOG_INFO("%s: slots hold %u streamed pages, %8.2f MiB\n", __func__, n_ring,
@@ -332,8 +344,9 @@ void llama_kv_stream::prepare(const std::vector<uint32_t> & cells, uint32_t n_kv
         dirty[c/page_size] = 1;
     }
 
-    // the attended pages that are not resident stream: packed for the decode kernel, in place for a gather
-    const bool decode = cells.size() <= decode_max_tokens || prefill_paged;
+    // Keep streamed pages packed only when both paged-attention paths support this model's shape.
+    // Otherwise copy them to their logical page offsets for the contiguous gather path.
+    const bool paged = paged_attention();
 
     std::fill(page_ring.begin(), page_ring.end(), -1);
     n_streamed = 0;
@@ -347,7 +360,7 @@ void llama_kv_stream::prepare(const std::vector<uint32_t> & cells, uint32_t n_kv
             zero_host(p);
         }
         page_ring[p] = n_streamed++;
-        const uint32_t dst = decode ? page_ring[p] : p;
+        const uint32_t dst = paged ? page_ring[p] : p;
         if (!copies.empty() && copies.back().page + copies.back().n == p && copies.back().slot + copies.back().n == dst) {
             copies.back().n++;
         } else {
@@ -355,8 +368,8 @@ void llama_kv_stream::prepare(const std::vector<uint32_t> & cells, uint32_t n_kv
         }
     }
 
-    // packed, the streamed pages must fit the slots (sized in set_backend)
-    GGML_ASSERT(!decode || (int64_t) n_streamed*page_size <= slots[0].k->ne[1]);
+    // packed pages must fit the ring slots (sized in set_backend)
+    GGML_ASSERT(!paged || (int64_t) n_streamed*page_size <= slots[0].k->ne[1]);
 
     run_list.clear();
     for (uint32_t p = 0; p < n_att; ++p) {
